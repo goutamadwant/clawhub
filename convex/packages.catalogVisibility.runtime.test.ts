@@ -154,6 +154,73 @@ const routes = [
 ];
 
 describe("normal plugin catalog visibility", () => {
+  it("paginates published versions past a pending release with native cursors", async () => {
+    const t = convexTest(schema, modules);
+    const { packageId, ownerUserId } = await t.run(async (ctx) => {
+      const createdOwnerUserId = await ctx.db.insert("users", { handle: "version-owner" });
+      const createdPackageId = await ctx.db.insert("packages", {
+        name: "@runtime/version-pagination",
+        normalizedName: "@runtime/version-pagination",
+        displayName: "Version pagination",
+        ownerUserId: createdOwnerUserId,
+        family: "code-plugin",
+        channel: "community",
+        isOfficial: false,
+        tags: {},
+        stats: { downloads: 0, installs: 0, stars: 0, versions: 2 },
+        createdAt: 1,
+        updatedAt: 3,
+      });
+      return { packageId: createdPackageId, ownerUserId: createdOwnerUserId };
+    });
+    const insertRelease = async (
+      version: string,
+      createdAt: number,
+      publicationStatus?: "pending" | "published",
+    ) =>
+      await t.run(async (ctx) =>
+        ctx.db.insert("packageReleases", {
+          packageId,
+          version,
+          publicationStatus,
+          changelog: "Runtime fixture",
+          distTags: [],
+          files: [],
+          integritySha256: version.padEnd(64, "0").slice(0, 64),
+          createdAt,
+          createdBy: ownerUserId,
+        }),
+      );
+
+    await insertRelease("3.0.0", 3, "pending");
+    const publishedReleaseId = await insertRelease("2.0.0", 2, "published");
+    await insertRelease("1.0.0", 1);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(packageId, {
+        latestReleaseId: publishedReleaseId,
+        latestVersionSummary: {
+          version: "2.0.0",
+          createdAt: 2,
+          changelog: "Runtime fixture",
+        },
+      });
+    });
+
+    const first = await t.query(api.packages.listVersions, {
+      name: "@runtime/version-pagination",
+      paginationOpts: { cursor: null, numItems: 1 },
+    });
+    const second = await t.query(api.packages.listVersions, {
+      name: "@runtime/version-pagination",
+      paginationOpts: { cursor: first.continueCursor, numItems: 1 },
+    });
+
+    expect(first.page.map((release) => release.version)).toEqual(["2.0.0"]);
+    expect(first.isDone).toBe(false);
+    expect(second.page.map((release) => release.version)).toEqual(["1.0.0"]);
+    expect(second.isDone).toBe(true);
+  });
+
   it("continues family-less official-first category pages without restarting", async () => {
     const previous = process.env.CLAWHUB_EXPERIMENTAL_CLAWS;
     delete process.env.CLAWHUB_EXPERIMENTAL_CLAWS;
