@@ -24,7 +24,7 @@ import {
   type PackageVerificationTier,
 } from "clawhub-schema";
 import { getPage, type IndexKey } from "convex-helpers/server/pagination";
-import { paginationOptsValidator } from "convex/server";
+import { paginationOptsValidator, type PaginationOptions } from "convex/server";
 import { ConvexError, v, type Value } from "convex/values";
 import semver from "semver";
 import { internal } from "./_generated/api";
@@ -1382,9 +1382,15 @@ function toManagerPackageRelease(release: Doc<"packageReleases">, family: Packag
 async function paginatePublishedPackageReleases(
   ctx: QueryCtx,
   packageId: Id<"packages">,
-  paginationOpts: { cursor: string | null; numItems: number },
+  paginationOpts: PaginationOptions,
 ) {
-  const result = await ctx.db
+  const numItems = Math.max(1, Math.min(paginationOpts.numItems, MAX_PUBLIC_LIST_PAGE_SIZE));
+  const scanLimit = Math.min(
+    MAX_PUBLIC_LIST_FILTER_SCAN_DOCUMENTS,
+    numItems * MAX_PUBLIC_LIST_FILTER_SCAN_PAGES,
+  );
+  // Convex allows one native pagination call per query, including filtered pages.
+  return await ctx.db
     .query("packageReleases")
     .withIndex("by_package_active_created", (q) =>
       q.eq("packageId", packageId).eq("softDeletedAt", undefined),
@@ -1399,9 +1405,11 @@ async function paginatePublishedPackageReleases(
       ),
     )
     .order("desc")
-    .paginate(paginationOpts);
-
-  return { ...result, page: result.page.filter(isPublishedPackageRelease) };
+    .paginate({
+      ...paginationOpts,
+      numItems,
+      maximumRowsRead: Math.min(paginationOpts.maximumRowsRead ?? scanLimit, scanLimit),
+    });
 }
 
 function packageArtifactSummary(

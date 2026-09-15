@@ -7561,7 +7561,11 @@ describe("packages public queries", () => {
       continueCursor: "",
     });
     expect(paginatePublished).toHaveBeenCalledTimes(1);
-    expect(paginatePublished).toHaveBeenCalledWith({ cursor: null, numItems: 1 });
+    expect(paginatePublished).toHaveBeenCalledWith({
+      cursor: null,
+      numItems: 1,
+      maximumRowsRead: 6,
+    });
     expect(paginateUnfiltered).not.toHaveBeenCalled();
     expect(releaseIndexNames).toEqual(["by_package_active_created"]);
   });
