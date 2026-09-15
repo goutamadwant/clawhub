@@ -554,6 +554,10 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   backend claim path must cap only a single worker claim size and must not impose
   a global active-scan ceiling; horizontal capacity is controlled by worker
   dispatch count, worker batch limit, provider quotas, and cost monitoring.
+- Normal scan claims read only enough ready queue rows to fill the worker's
+  remaining capacity. Broader pagination is reserved for skipping blocked legacy
+  GitHub jobs or the catalog lane's bounded admission window; disabling a rollout
+  must not make every native one-job claim read hundreds of unrelated jobs.
 - The Skill Card verification envelope exposes ClawScan as the top-level
   `security` verdict for install automation, with deterministic and third-party
   scanner evidence grouped under `security.signals`. Clients should key install
@@ -608,6 +612,18 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   skill/package rescans for a chosen artifact, or paged all-active-latest skill
   rescan batches. The old suspicious LLM bucket tools (`all`, `llm-only`,
   `vt-only`, `both`) are retired.
+- Security workers back off and retry a transient claim API failure up to three
+  times before draining their existing leases. Every failed call remains in
+  claim-health counters, and the claim window/max-jobs limits still apply.
+  This does not retry terminal scan failures or change their job identities.
+  Authentication/validation failures do not enter this transient retry path.
+- Recoverable bulk skill requests use administrator-scoped request IDs. Their
+  job identities, cursor boundary and counters commit atomically in the permanent
+  batch audit entry. An identical replay returns that receipt before traversing
+  current skills, even after completion or permanent failure; it must not create
+  replacement jobs. Conflicting reuse fails. Optional ordered version baselines
+  reject page drift atomically. Legacy batches without receipt IDs require
+  read-only, fully paginated exact-version job reconciliation before admission.
 - Package/plugin scan backfills may recompute deterministic static scan results for older releases,
   but those results remain ClawScan context and are not public trust status.
 - ClawPack package releases materialize parsed npm-pack artifact entries into the release file
