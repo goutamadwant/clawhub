@@ -662,6 +662,18 @@ export const enqueueSkillVersionScanInternal = internalMutation({
   },
 });
 
+type BulkSkillRescanReceipt = {
+  ok: true;
+  mode: "all-active-latest";
+  queued: number;
+  alreadyQueued: number;
+  skipped: number;
+  jobIds: Id<"securityScanJobs">[];
+  nextCursor: string | null;
+  done: boolean;
+  sampleSlugs: string[];
+};
+
 export const enqueueBulkSkillRescanBatchForAdminInternal = internalMutation({
   args: {
     actorUserId: v.id("users"),
@@ -669,15 +681,52 @@ export const enqueueBulkSkillRescanBatchForAdminInternal = internalMutation({
     cursor: v.optional(v.union(v.string(), v.null())),
     batchSize: v.optional(v.number()),
     dryRun: v.optional(v.boolean()),
+    requestId: v.optional(v.string()),
+    expectedVersionIds: v.optional(v.array(v.id("skillVersions"))),
   },
   handler: async (ctx, args) => {
     const actor = await ctx.db.get(args.actorUserId);
-    if (!actor) throw new ConvexError("Unauthorized");
+    if (!actor || actor.deletedAt || actor.deactivatedAt) throw new ConvexError("Unauthorized");
     assertAdmin(actor);
 
     const mode = args.mode ?? "all-active-latest";
     const batchSize = normalizeBulkRescanBatchSize(args.batchSize);
     const dryRun = args.dryRun === true;
+    if (args.requestId !== undefined && !/^[a-zA-Z0-9._:-]{1,128}$/.test(args.requestId)) {
+      throw new ConvexError(
+        "requestId must be 1-128 letters, digits, dots, underscores, colons or hyphens",
+      );
+    }
+    if (args.expectedVersionIds && args.expectedVersionIds.length > 100) {
+      throw new ConvexError("At most 100 expected version IDs are allowed");
+    }
+    const fingerprint = JSON.stringify({
+      mode,
+      batchSize,
+      cursor: args.cursor ?? null,
+      expectedVersionIds: args.expectedVersionIds ?? null,
+    });
+    const receiptTarget = args.requestId ? `bulk-rescan:${actor._id}:${args.requestId}` : null;
+    // The receipt and jobs commit together. Replay must precede page reads, even
+    // after jobs finish or a newer publish changes the selected versions.
+    if (receiptTarget && !dryRun) {
+      const saved = await ctx.db
+        .query("auditLogs")
+        .withIndex("by_target_action", (q) =>
+          q
+            .eq("targetType", "securityScanBatch")
+            .eq("targetId", receiptTarget)
+            .eq("action", "skill.clawscan.bulk_rescan_batch"),
+        )
+        .unique();
+      if (saved) {
+        if (saved.metadata?.fingerprint !== fingerprint) {
+          throw new ConvexError("requestId was already used with different parameters");
+        }
+        return saved.metadata.receipt as BulkSkillRescanReceipt;
+      }
+    }
+    const selectedVersionIds: Id<"skillVersions">[] = [];
     const page = await ctx.db
       .query("skills")
       .withIndex("by_active_created", (q) => q.eq("softDeletedAt", undefined))
@@ -706,6 +755,7 @@ export const enqueueBulkSkillRescanBatchForAdminInternal = internalMutation({
         continue;
       }
 
+      selectedVersionIds.push(version._id);
       if (dryRun) {
         const existing = await ctx.db
           .query("securityScanJobs")
@@ -733,7 +783,25 @@ export const enqueueBulkSkillRescanBatchForAdminInternal = internalMutation({
       else queued += 1;
     }
 
+    if (
+      args.expectedVersionIds &&
+      JSON.stringify(selectedVersionIds) !== JSON.stringify(args.expectedVersionIds)
+    ) {
+      // A throw rolls back every enqueue in this transaction.
+      throw new ConvexError("Exact-version baseline changed; capture a new plan before enqueueing");
+    }
     const nextCursor = page.isDone ? null : page.continueCursor;
+    const receipt: BulkSkillRescanReceipt = {
+      ok: true,
+      mode,
+      queued,
+      alreadyQueued,
+      skipped,
+      jobIds,
+      nextCursor,
+      done: page.isDone,
+      sampleSlugs,
+    };
 
     if (!dryRun) {
       const now = Date.now();
@@ -741,7 +809,7 @@ export const enqueueBulkSkillRescanBatchForAdminInternal = internalMutation({
         actorUserId: actor._id,
         action: "skill.clawscan.bulk_rescan_batch",
         targetType: "securityScanBatch",
-        targetId: `bulk-rescan:${now}`,
+        targetId: receiptTarget ?? `bulk-rescan:${now}`,
         metadata: {
           mode,
           batchSize,
@@ -751,21 +819,46 @@ export const enqueueBulkSkillRescanBatchForAdminInternal = internalMutation({
           cursor: args.cursor ?? null,
           nextCursor,
           sampleSlugs,
+          ...(receiptTarget ? { fingerprint, receipt } : {}),
         },
         createdAt: now,
       });
     }
 
+    return receipt;
+  },
+});
+
+// Read-only recovery for legacy batches whose response did not reach the caller.
+// Paginate durable job identities; never infer a missing job from a truncated page.
+export const getSkillScanJobHistoryForAdminInternal = internalQuery({
+  args: {
+    actorUserId: v.id("users"),
+    versionId: v.id("skillVersions"),
+    cursor: v.optional(v.union(v.string(), v.null())),
+  },
+  handler: async (ctx, args) => {
+    const actor = await ctx.db.get(args.actorUserId);
+    if (!actor || actor.deletedAt || actor.deactivatedAt) throw new ConvexError("Unauthorized");
+    assertAdmin(actor);
+    const page = await ctx.db
+      .query("securityScanJobs")
+      .withIndex("by_skill_version", (q) => q.eq("skillVersionId", args.versionId))
+      .order("desc")
+      .paginate({ cursor: args.cursor ?? null, numItems: 100, maximumBytesRead: 1_000_000 });
     return {
       ok: true as const,
-      mode,
-      queued,
-      alreadyQueued,
-      skipped,
-      jobIds,
-      nextCursor,
+      jobs: page.page.map((job) => ({
+        jobId: job._id,
+        versionId: job.skillVersionId!,
+        source: job.source,
+        status: job.status,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+        completedAt: job.completedAt ?? null,
+      })),
+      nextCursor: page.isDone ? null : page.continueCursor,
       done: page.isDone,
-      sampleSlugs,
     };
   },
 });
@@ -2995,18 +3088,29 @@ export async function listReadySourceJobsForClaimHandler(
     excludeGitHubSkillSync: boolean;
   },
 ): Promise<ReadySourceJobsForClaimPage> {
+  return await readySourceJobsForClaimQuery(
+    ctx,
+    args.source,
+    args.now,
+    args.excludeGitHubSkillSync,
+  ).paginate({ cursor: args.cursor, numItems: args.numItems });
+}
+
+function readySourceJobsForClaimQuery(
+  ctx: Pick<QueryCtx, "db">,
+  source: SecurityScanJobSource,
+  now: number,
+  excludeGitHubSkillSync: boolean,
+) {
   const query = ctx.db
     .query("securityScanJobs")
     .withIndex("by_status_source_next_run_at", (q) =>
-      q.eq("status", "queued").eq("source", args.source).lte("nextRunAt", args.now),
+      q.eq("status", "queued").eq("source", source).lte("nextRunAt", now),
     );
-  const eligibleQuery = args.excludeGitHubSkillSync
+  const eligibleQuery = excludeGitHubSkillSync
     ? query.filter((q) => q.neq(q.field("rolloutGate"), "github-skill-sync"))
     : query;
-  return await eligibleQuery.order("asc").paginate({
-    cursor: args.cursor,
-    numItems: args.numItems,
-  });
+  return eligibleQuery.order("asc");
 }
 
 export const listReadySourceJobsForClaimInternal = internalQuery({
@@ -3103,8 +3207,28 @@ export const claimQueuedJobsInternal = internalMutation({
         // or canceled jobs cannot hide later runnable backlog after the cap is lowered.
         takeLimit = MAX_CODEX_SCAN_CLAIM_LIMIT;
       }
+      // Native queues normally fit in one bounded read. Keep that read in this
+      // transaction instead of paying a nested-query round trip per source.
+      // Legacy blocked jobs still use the paginated fallback below.
+      if (source !== "skills-sh-catalog-test") {
+        const candidates = await readySourceJobsForClaimQuery(
+          ctx,
+          source,
+          now,
+          !githubSkillSyncEnabled,
+        ).take(takeLimit);
+        let allClaimable = true;
+        for (const job of candidates) {
+          if (!(await isJobRolloutClaimable(job))) {
+            allClaimable = false;
+            break;
+          }
+        }
+        if (allClaimable) return candidates;
+      }
       const eligible: Doc<"securityScanJobs">[] = [];
       let cursor: string | null = null;
+      let pageSize = Math.min(takeLimit, MAX_CODEX_SCAN_CLAIM_LIMIT);
       do {
         const page: ReadySourceJobsForClaimPage = await runQueryRef<ReadySourceJobsForClaimPage>(
           ctx,
@@ -3113,14 +3237,18 @@ export const claimQueuedJobsInternal = internalMutation({
             source,
             now,
             cursor,
-            numItems: githubSkillSyncEnabled
-              ? Math.min(takeLimit, MAX_CODEX_SCAN_CLAIM_LIMIT)
-              : MAX_CODEX_SCAN_CLAIM_LIMIT,
+            numItems: pageSize,
             excludeGitHubSkillSync: !githubSkillSyncEnabled,
           },
         );
         for (const job of page.page) {
-          if (await isJobRolloutClaimable(job)) eligible.push(job);
+          if (await isJobRolloutClaimable(job)) {
+            eligible.push(job);
+          } else {
+            // Native claims should not read the whole queue. Expand only after
+            // blocked legacy GitHub jobs require scanning past the first page.
+            pageSize = MAX_CODEX_SCAN_CLAIM_LIMIT;
+          }
           if (eligible.length >= takeLimit) return eligible;
         }
         cursor = page.isDone ? null : page.continueCursor;
