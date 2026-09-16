@@ -9,6 +9,7 @@
 
 ### Fixes
 
+- API/CLI: preserve owner-qualified skill identities in catalog listings and accept explicit null public versions consistently across API and CLI schemas (thanks @HwangBae for the report and @goutamadwant for the fix).
 - Workers: delete a newly generated Skill Card blob when attachment fails, while preserving successfully attached cards and historical bundle fingerprints (thanks @SebTardif).
 - Publishing: fall back to local changelog notes when the provider stalls for ten seconds, including while reading the response body (thanks @SebTardif).
 - Web: bound Agent Skills discovery proxy requests to ten seconds, including stalled response bodies, so installers can recover from an unresponsive upstream (thanks @SebTardif).

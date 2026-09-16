@@ -4,6 +4,8 @@ import { expect, type APIRequestContext, type Page, test } from "@playwright/tes
 import convexBrowser from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
+import { parseArk } from "../../packages/schema/src/ark";
+import { ApiV1SkillListResponseSchema } from "../../packages/schema/src/schemas";
 import {
   expectNoFatalErrorUi,
   expectNoRuntimeErrors,
@@ -408,6 +410,21 @@ test("publishing a skill queues scan, queues skill-card generation, and shows th
   expect(readLocalStorageIds()).toHaveLength(storageBeforeRejectedCard.length + 1);
 
   const cardResponse = await waitForSkillCardEndpoint(page, slug, markdown);
+  const catalogResponse = await page.request.get(
+    `${convexSiteUrl()}/api/v1/skills?prefix=${encodeURIComponent(slug)}&limit=1`,
+  );
+  expect(catalogResponse.status()).toBe(200);
+  const catalog = parseArk(
+    ApiV1SkillListResponseSchema,
+    await catalogResponse.json(),
+    "published skill catalog",
+  );
+  expect(catalog.items).toHaveLength(1);
+  expect(catalog.items[0]).toMatchObject({
+    ownerHandle,
+    slug,
+    latestVersion: { version: "1.0.0" },
+  });
 
   const detailUrl = page.url().split("#", 1)[0];
   await page.goto(`${detailUrl}#skill-card`, { waitUntil: "domcontentloaded" });
