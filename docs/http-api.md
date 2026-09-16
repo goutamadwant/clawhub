@@ -832,12 +832,29 @@ Notes:
 
 ### `GET /api/v1/packages/{name}`
 
-Returns package detail metadata.
+Returns package detail metadata. The `owner.official` flag is the current publisher
+badge, independent of the package’s `isOfficial` flag. Response readers allow this
+field to be absent when querying registries that predate it.
 
 Notes:
 
 - Skills can also resolve through this route in the unified catalog.
 - Private packages return `404` unless the caller can read the owning publisher.
+
+### `GET /api/v1/packages/{name}/detail`
+
+Returns a plugin detail snapshot in one request: `package`, `owner`, `versions`
+(the first 10 published versions and `nextCursor`), the selected `version`,
+`readme`, and `security`. Existing package, version, and security field shapes are
+preserved. Code plugins and bundle plugins support this route.
+
+- `version` (optional query parameter) selects an exact release; otherwise the
+  current latest release is selected. A missing exact release returns `404`.
+- Package visibility and publisher permissions match the package metadata route.
+- Missing, moderation-blocked, or non-text README previews return `readme: null`.
+  The existing 200 KiB preview limit applies; oversized previews return `413`.
+- Security describes the selected release. Downloads still enforce their own
+  current moderation checks. Responses are not cached.
 
 ### `DELETE /api/v1/packages/{name}`
 
@@ -897,6 +914,7 @@ Response:
 {
   "overview": "ClawScan found no material security concerns.\n\nUse least-privileged credentials when configuring this plugin.",
   "securityAuditUrl": "https://clawhub.ai/openclaw/plugins/example-plugin/security-audit?version=1.2.3",
+  "verdict": "malicious",
   "package": {
     "name": "@openclaw/example-plugin",
     "displayName": "Example Plugin",
@@ -928,6 +946,7 @@ Response fields:
 - `overview` is the canonical summary-and-guidance text shown by the package
   security-audit page. Install clients may present it without reconstructing
   audit text from scanner fields.
+- `verdict` is the combined display verdict used by the package security-audit page, including static analysis and visible agentic-risk findings. It can differ from the download-policy `trust.scanStatus`. Older registries may omit it; clients should treat that as unavailable display metadata.
 - `securityAuditUrl` links to the exact release's package security-audit page.
 - `package.name`, `package.displayName`, and `package.family` identify the
   resolved registry package.

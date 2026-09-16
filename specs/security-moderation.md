@@ -24,11 +24,15 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   The legacy `TRUST_FORWARDED_IPS` flag must never authorize raw IP headers.
 - API tokens retain per-user quotas. A server-owned loopback Convex deployment
   may use a local development bucket when no hosted environment is configured.
-- Inspector worker routes, signed archive metric receipts, and Convex Auth's
-  OAuth sign-in/callback routes retain their handler-owned credential checks at
+- The production skills.sh mirror operator, inspector worker routes, signed
+  archive metric receipts, and Convex Auth's OAuth sign-in/callback routes
+  retain their handler-owned credential checks at
   the Convex origin. They do not use anonymous IP quotas or redirect credentials
   to another origin. Worker credentials never exempt ordinary public API routes
   from verified ingress.
+- The skills.sh operator accepts only the verified GitHub Actions identity for
+  this repository's sync workflow on `main` in the `Production` environment.
+  Its Test operator continues to require an admin API token and API quotas.
 - Rollout requires the identity-forwarding edge before the backend starts
   enforcing verified anonymous ingress.
 
@@ -554,6 +558,17 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   backend claim path must cap only a single worker claim size and must not impose
   a global active-scan ceiling; horizontal capacity is controlled by worker
   dispatch count, worker batch limit, provider quotas, and cost monitoring.
+- Local bulk campaigns may assign disjoint lists of existing job IDs to shared
+  worker shards. Assigned claims read only those IDs, accept only queued, due,
+  ungated `bulk-rescan` skill-version jobs, and use the normal lease, hydration,
+  scan and result paths. They must not fall back to the general queue when an
+  assignment is empty or stale, claim package jobs, or retry terminal failures.
+  The dedicated priority shard remains unassigned and retains its normal queue.
+  Assignment plans, admission baselines, receipts, cursor and capacity control
+  remain local; no server-side campaign coordinator or assignment table is added.
+  Admin batch status exposes queued identities from the same bounded point reads
+  as its counts, so completed jobs in partial batches cannot fill the local
+  assignment payload. This is an observation; claims still recheck eligibility.
 - Normal scan claims read only enough ready queue rows to fill the worker's
   remaining capacity. Broader pagination is reserved for skipping blocked legacy
   GitHub jobs or the catalog lane's bounded admission window; disabling a rollout

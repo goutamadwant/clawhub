@@ -10,6 +10,7 @@ vi.mock("./lib/verifiedClientIp", () => ({
   getVerifiedClientIp: async () => "203.0.113.1",
 }));
 import { api, internal } from "./_generated/api";
+import type { Doc } from "./_generated/dataModel";
 import { extractPackageDigestFields, upsertPackageSearchDigest } from "./lib/packageSearchDigest";
 import { hashToken } from "./lib/tokens";
 import { PACKAGE_TRENDING_LEADERBOARD_KIND } from "./packageLeaderboards";
@@ -154,6 +155,158 @@ const routes = [
 ];
 
 describe("normal plugin catalog visibility", () => {
+  it("bounds version requests and continues after an unpublished scan page", async () => {
+    const { t, ownerUserId } = await fixture();
+    await t.run(async (ctx) => {
+      const pkg = await ctx.db
+        .query("packages")
+        .filter((q) => q.eq(q.field("name"), "@openclaw/whatsapp"))
+        .unique();
+      if (!pkg) throw new Error("Missing version fixture package");
+      for (let index = 1; index <= 201; index += 1) {
+        await ctx.db.insert("packageReleases", {
+          packageId: pkg._id,
+          version: `1.0.${index}`,
+          publicationStatus: "published",
+          changelog: "Published release",
+          distTags: [],
+          files: [],
+          integritySha256: "a".repeat(64),
+          createdAt: index + 1,
+          createdBy: ownerUserId,
+        });
+      }
+      for (let index = 0; index < 7; index += 1) {
+        await ctx.db.insert("packageReleases", {
+          packageId: pkg._id,
+          version: `2.0.${index}`,
+          publicationStatus: "pending",
+          changelog: "Pending release",
+          distTags: [],
+          files: [],
+          integritySha256: "b".repeat(64),
+          createdAt: 300 + index,
+          createdBy: ownerUserId,
+        });
+      }
+    });
+
+    for (const query of [
+      api.packages.listVersions,
+      internal.packages.listVersionsForViewerInternal,
+    ]) {
+      const bounded = await t.query(query, {
+        name: "@openclaw/whatsapp",
+        paginationOpts: { cursor: null, numItems: 1000 },
+      });
+      expect(bounded.page).toHaveLength(200);
+      expect(bounded.isDone).toBe(false);
+
+      const skipped = await t.query(query, {
+        name: "@openclaw/whatsapp",
+        paginationOpts: { cursor: null, numItems: 1 },
+      });
+      expect(skipped.page).toEqual([]);
+      expect(skipped.isDone).toBe(false);
+      expect(skipped.pageStatus).toBe("SplitRequired");
+      expect(skipped.splitCursor).toBeTruthy();
+
+      const next = await t.query(query, {
+        name: "@openclaw/whatsapp",
+        paginationOpts: { cursor: skipped.continueCursor, numItems: 1 },
+      });
+      expect(next.page.map((release) => release.version)).toEqual(["1.0.201"]);
+    }
+  });
+
+  it("paginates published versions past a pending release with native cursors", async () => {
+    const t = convexTest(schema, modules);
+    const { packageId, ownerUserId } = await t.run(async (ctx) => {
+      const createdOwnerUserId = await ctx.db.insert("users", { handle: "version-owner" });
+      const createdPackageId = await ctx.db.insert("packages", {
+        name: "@runtime/version-pagination",
+        normalizedName: "@runtime/version-pagination",
+        displayName: "Version pagination",
+        ownerUserId: createdOwnerUserId,
+        family: "code-plugin",
+        channel: "community",
+        isOfficial: false,
+        tags: {},
+        stats: { downloads: 0, installs: 0, stars: 0, versions: 2 },
+        createdAt: 1,
+        updatedAt: 3,
+      });
+      return { packageId: createdPackageId, ownerUserId: createdOwnerUserId };
+    });
+    const insertRelease = async (
+      version: string,
+      createdAt: number,
+      visibility: Partial<
+        Pick<Doc<"packageReleases">, "publicationStatus" | "ownerDeletedAt" | "softDeletedAt">
+      > = {},
+    ) =>
+      await t.run(async (ctx) =>
+        ctx.db.insert("packageReleases", {
+          packageId,
+          version,
+          ...visibility,
+          changelog: "Runtime fixture",
+          distTags: [],
+          files: [],
+          integritySha256: version.padEnd(64, "0").slice(0, 64),
+          createdAt,
+          createdBy: ownerUserId,
+        }),
+      );
+
+    await insertRelease("6.0.0", 6, { softDeletedAt: 10 });
+    await insertRelease("5.0.0", 5, { ownerDeletedAt: 10 });
+    await insertRelease("4.0.0", 4, { publicationStatus: "blocked" });
+    await insertRelease("3.0.0", 3, { publicationStatus: "pending" });
+    const publishedReleaseId = await insertRelease("2.0.0", 2, {
+      publicationStatus: "published",
+    });
+    await insertRelease("1.0.0", 1);
+    await t.run(async (ctx) => {
+      await ctx.db.patch(packageId, {
+        latestReleaseId: publishedReleaseId,
+        latestVersionSummary: {
+          version: "2.0.0",
+          createdAt: 2,
+          changelog: "Runtime fixture",
+        },
+      });
+    });
+
+    const first = await t.query(api.packages.listVersions, {
+      name: "@runtime/version-pagination",
+      paginationOpts: { cursor: null, numItems: 1 },
+    });
+    const second = await t.query(api.packages.listVersions, {
+      name: "@runtime/version-pagination",
+      paginationOpts: { cursor: first.continueCursor, numItems: 1 },
+    });
+
+    expect(first.page.map((release) => release.version)).toEqual(["2.0.0"]);
+    expect(first.isDone).toBe(false);
+    expect(second.page.map((release) => release.version)).toEqual(["1.0.0"]);
+    expect(second.isDone).toBe(true);
+
+    const limited = await t.query(api.packages.listVersions, {
+      name: "@runtime/version-pagination",
+      paginationOpts: { cursor: null, numItems: 1, maximumRowsRead: 2 },
+    });
+    expect(limited.page).toEqual([]);
+    expect(limited.isDone).toBe(false);
+    expect(limited.splitCursor).toBeTruthy();
+
+    const expanded = await t.query(api.packages.listVersions, {
+      name: "@runtime/version-pagination",
+      paginationOpts: { cursor: null, numItems: 1, endCursor: second.continueCursor },
+    });
+    expect(expanded.page.map((release) => release.version)).toEqual(["2.0.0", "1.0.0"]);
+  });
+
   it("continues family-less official-first category pages without restarting", async () => {
     const previous = process.env.CLAWHUB_EXPERIMENTAL_CLAWS;
     delete process.env.CLAWHUB_EXPERIMENTAL_CLAWS;

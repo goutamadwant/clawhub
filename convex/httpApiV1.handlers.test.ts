@@ -2629,6 +2629,47 @@ describe("httpApiV1 handlers", () => {
     });
   });
 
+  it.each([
+    ["", "catalog"],
+    ["&category=tools&topic=automation", "shelf"],
+    ["&highlightedOnly=true", "shelf"],
+  ])("records final canonical skill counts with scope %s", async (filters, scope) => {
+    const observationWrites: Record<string, unknown>[] = [];
+    const runAction = vi.fn().mockResolvedValue([
+      { source: "clawhub", id: "native:first", official: true },
+      { source: "clawhub", id: "native:second", official: false, publisher: { official: true } },
+      { source: "skills-sh", id: "external:third", official: false },
+    ]);
+    const response = await __handlers.searchSkillsV1Handler(
+      makeCtx({
+        runAction,
+        runMutation: (_mutation: unknown, args: Record<string, unknown>) => {
+          if (isRateLimitArgs(args)) return okRate();
+          observationWrites.push(args);
+          return null;
+        },
+      }),
+      new Request(
+        `https://example.com/api/v1/search?q=%20Weather%20%20API%20&searchSource=clawhub-web${filters}`,
+      ),
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.results).toHaveLength(3);
+    expect(observationWrites).toEqual([
+      {
+        source: "clawhub-web",
+        artifactKind: "skill",
+        scope,
+        normalizedQuery: "weather api",
+        category: filters.includes("category=") ? "tools" : undefined,
+        topic: filters.includes("topic=") ? "automation" : undefined,
+        resultCount: 3,
+        officialResultCount: 1,
+      },
+    ]);
+  });
+
   it("search includes public owner metadata without publisher bio", async () => {
     const runAction = vi.fn().mockResolvedValue([
       {
@@ -12753,6 +12794,195 @@ describe("httpApiV1 handlers", () => {
     }
   });
 
+  it.each(["clawhub-web", "openclaw-control-ui"] as const)(
+    "records one marked %s plugin search from the exact combined visible response",
+    async (source) => {
+      const observationWrites: Record<string, unknown>[] = [];
+      const runQuery = vi.fn((_, args: Record<string, unknown>) => {
+        if (args.family === "code-plugin") {
+          return [
+            {
+              score: 10,
+              package: {
+                ...makeCatalogItem("weather-code", { family: "code-plugin", updatedAt: 100 }),
+                isOfficial: true,
+              },
+            },
+          ];
+        }
+        if (args.family === "bundle-plugin") {
+          return [
+            {
+              score: 8,
+              package: makeCatalogItem("weather-bundle", {
+                family: "bundle-plugin",
+                updatedAt: 80,
+              }),
+            },
+          ];
+        }
+        throw new Error(`unexpected family ${String(args.family)}`);
+      });
+      const ctx = makeCtx({
+        runQuery,
+        runMutation: (_mutation: unknown, args: Record<string, unknown>) => {
+          if (isRateLimitArgs(args)) return okRate();
+          observationWrites.push(args);
+          return null;
+        },
+      });
+
+      const response = await __handlers.pluginsGetRouterV1Handler(
+        ctx,
+        new Request(
+          `https://example.com/api/v1/plugins/search?q=%20Weather%20%20API%20&category=tools&topic=automation&searchSource=${source}`,
+        ),
+      );
+
+      expect(response.status).toBe(200);
+      expect(observationWrites).toEqual([
+        {
+          source,
+          artifactKind: "plugin",
+          scope: "shelf",
+          normalizedQuery: "weather api",
+          category: "tools",
+          topic: "automation",
+          resultCount: 2,
+          officialResultCount: 1,
+        },
+      ]);
+    },
+  );
+
+  it.each([
+    [
+      "oversized marked query",
+      `https://example.com/api/v1/plugins/search?q=${"x".repeat(257)}&searchSource=clawhub-web`,
+      200,
+    ],
+    [
+      "oversized marked topic",
+      `https://example.com/api/v1/plugins/search?q=weather&topic=${"x".repeat(121)}&searchSource=clawhub-web`,
+      200,
+    ],
+    [
+      "marked skill family",
+      "https://example.com/api/v1/plugins/search?q=weather&family=skill&searchSource=clawhub-web",
+      200,
+    ],
+    [
+      "marked claw family",
+      "https://example.com/api/v1/plugins/search?q=weather&family=claw&searchSource=clawhub-web",
+      200,
+    ],
+    ["unmarked plugin request", "https://example.com/api/v1/plugins/search?q=weather", 200],
+    [
+      "unknown plugin source",
+      "https://example.com/api/v1/plugins/search?q=weather&searchSource=crawler",
+      200,
+    ],
+    [
+      "marked generic package request",
+      "https://example.com/api/v1/packages/search?q=weather&searchSource=clawhub-web",
+      200,
+    ],
+    [
+      "marked empty plugin query",
+      "https://example.com/api/v1/plugins/search?q=%20%20&searchSource=clawhub-web",
+      400,
+    ],
+  ])("does not record %s", async (_case, requestUrl, expectedStatus) => {
+    if (_case === "marked claw family") vi.stubEnv("CLAWHUB_EXPERIMENTAL_CLAWS", "1");
+    const observationWrites: Record<string, unknown>[] = [];
+    const ctx = makeCtx({
+      runQuery: vi.fn().mockResolvedValue([]),
+      runMutation: (_mutation: unknown, args: Record<string, unknown>) => {
+        if (isRateLimitArgs(args)) return okRate();
+        observationWrites.push(args);
+        return null;
+      },
+    });
+    const handler = requestUrl.includes("/plugins/")
+      ? __handlers.pluginsGetRouterV1Handler
+      : __handlers.packagesGetRouterV1Handler;
+
+    const response = await handler(ctx, new Request(requestUrl));
+
+    expect(response.status).toBe(expectedStatus);
+    expect(observationWrites).toEqual([]);
+  });
+
+  it("does not record a marked plugin search when result assembly fails", async () => {
+    const observationWrites: Record<string, unknown>[] = [];
+    const ctx = makeCtx({
+      runQuery: vi.fn().mockRejectedValue(new Error("search unavailable")),
+      runMutation: (_mutation: unknown, args: Record<string, unknown>) => {
+        if (isRateLimitArgs(args)) return okRate();
+        observationWrites.push(args);
+        return null;
+      },
+    });
+
+    await expect(
+      __handlers.pluginsGetRouterV1Handler(
+        ctx,
+        new Request(
+          "https://example.com/api/v1/plugins/search?q=weather&searchSource=openclaw-control-ui",
+        ),
+      ),
+    ).rejects.toThrow("search unavailable");
+    expect(observationWrites).toEqual([]);
+  });
+
+  it("excludes a request aborted before the completed result is recorded", async () => {
+    const controller = new AbortController();
+    const observationWrites: unknown[] = [];
+    const ctx = makeCtx({
+      runQuery: async () => {
+        controller.abort();
+        return [];
+      },
+      runMutation: (_mutation: unknown, args: Record<string, unknown>) => {
+        if (isRateLimitArgs(args)) return okRate();
+        observationWrites.push(args);
+        return null;
+      },
+    });
+    await __handlers.pluginsGetRouterV1Handler(
+      ctx,
+      new Request("https://example.com/api/v1/plugins/search?q=weather&searchSource=clawhub-web", {
+        signal: controller.signal,
+      }),
+    );
+    expect(observationWrites).toEqual([]);
+  });
+
+  it("keeps search available and logs no query when observation storage fails", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const ctx = makeCtx({
+      runQuery: vi.fn().mockResolvedValue([]),
+      runMutation: (_mutation: unknown, args: Record<string, unknown>) => {
+        if (isRateLimitArgs(args)) return okRate();
+        throw new Error("storage failed for sensitive query text");
+      },
+    });
+
+    const response = await __handlers.pluginsGetRouterV1Handler(
+      ctx,
+      new Request(
+        "https://example.com/api/v1/plugins/search?q=private-query&searchSource=openclaw-control-ui",
+      ),
+    );
+
+    expect(response.status).toBe(200);
+    expect(log).toHaveBeenCalledWith(
+      "[catalog-search-observations] failed to record marked search",
+      { source: "openclaw-control-ui" },
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toContain("private-query");
+  });
+
   it("plugins search forwards New eligibility to both plugin families", async () => {
     const runQuery = vi.fn().mockResolvedValue([]);
     const runMutation = vi.fn().mockResolvedValue(okRate());
@@ -14012,6 +14242,7 @@ describe("httpApiV1 handlers", () => {
     expect(json.trust).not.toHaveProperty("moderationReason");
     expect(json).toEqual({
       overview: "No security analysis has been recorded yet.",
+      verdict: "pending",
       securityAuditUrl: "https://example.com/plugins/demo-plugin/security-audit?version=1.0.0",
       package: {
         name: "demo-plugin",
